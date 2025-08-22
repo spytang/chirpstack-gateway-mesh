@@ -207,6 +207,12 @@ async fn proxy_uplink_mesh_packet(pl: &gw::UplinkFrame, packet: MeshPacket) -> R
             .metadata
             .insert("relay_id".to_string(), hex::encode(mesh_pl.relay_id));
 
+        // Calculate mesh delay (in ms) and add to metadata.
+        let delay = helpers::ms_since_midnight().saturating_sub(mesh_pl.timestamp);
+        rx_info
+            .metadata
+            .insert("mesh_delay_ms".to_string(), delay.to_string());
+
         // Set RSSI and SNR.
         rx_info.snr = mesh_pl.metadata.snr.into();
         rx_info.rssi = mesh_pl.metadata.rssi.into();
@@ -463,6 +469,7 @@ async fn relay_uplink_lora_packet(pl: &gw::UplinkFrame) -> Result<()> {
                 rssi: rx_info.rssi as i16,
                 snr: rx_info.snr as i8,
             },
+            timestamp: helpers::ms_since_midnight(),
             relay_id: backend::get_relay_id().await?,
             phy_payload: pl.phy_payload.clone(),
         }),
