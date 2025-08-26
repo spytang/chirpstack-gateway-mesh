@@ -27,7 +27,7 @@ static UPLINK_ID: Mutex<u16> = Mutex::new(0);
 static UPLINK_CONTEXT: LazyLock<Mutex<HashMap<u16, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PAYLOAD_CACHE: LazyLock<Mutex<Cache<PayloadCache>>> =
-    LazyLock::new(|| Mutex::new(Cache::new(64)));
+    LazyLock::new(|| Mutex::new(Cache::new(256)));
 
 // Handle LoRaWAN payload (non-proprietary).
 pub async fn handle_uplink(border_gateway: bool, pl: &gw::UplinkFrame) -> Result<()> {
