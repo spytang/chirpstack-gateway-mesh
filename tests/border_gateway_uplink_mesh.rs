@@ -118,5 +118,7 @@ async fn test_border_gateway_uplink_mesh() {
     assert_eq!(gw::CrcStatus::CrcOk as i32, rx_info.crc_status);
     assert_eq!("01020304", rx_info.metadata.get("relay_id").unwrap());
     assert_eq!("1", rx_info.metadata.get("hop_count").unwrap());
+    assert_eq!("123", rx_info.metadata.get("uplink_id").unwrap());
+    assert_eq!(123, rx_info.uplink_id);
     assert!(rx_info.metadata.contains_key("mesh_delay_ms"));
 }
