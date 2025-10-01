@@ -162,22 +162,24 @@ impl fmt::Display for MeshPacket {
         match &self.payload {
             Payload::Uplink(v) => write!(
                 f,
-                "[{:?} hop_count: {}, uplink_id: {}, timestamp: {}, relay_id: {}, mic: {}]",
+                "[{:?} hop_count: {}, uplink_id: {}, timestamp: {}, relay_id: {}, mic: {}, lorawan_phy_payload: {}]",
                 self.mhdr.payload_type,
                 self.mhdr.hop_count,
                 v.metadata.uplink_id,
                 v.timestamp,
                 hex::encode(v.relay_id),
                 self.mic.map(hex::encode).unwrap_or_default(),
+                hex::encode(&v.phy_payload),
             ),
             Payload::Downlink(v) => write!(
                 f,
-                "[{:?} hop_count: {}, uplink_id: {}, relay_id: {}, mic: {}]",
+                "[{:?} hop_count: {}, uplink_id: {}, relay_id: {}, mic: {}, lorawan_phy_payload: {}]",
                 self.mhdr.payload_type,
                 self.mhdr.hop_count,
                 v.metadata.uplink_id,
                 hex::encode(v.relay_id),
                 self.mic.map(hex::encode).unwrap_or_default(),
+                hex::encode(&v.phy_payload),
             ),
             Payload::Event(v) => write!(
                 f,
