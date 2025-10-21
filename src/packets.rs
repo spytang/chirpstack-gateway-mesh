@@ -628,10 +628,16 @@ impl Event {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct HeartbeatPayload {
     pub relay_path: Vec<RelayPath>,
+    pub atx_path_cost: u32,
+    pub atx_depth: u16,
 }
 
 impl HeartbeatPayload {
     pub fn from_slice(b: &[u8]) -> Result<Self> {
+        if b.len() >= 6 && b[0] == 0x01 && b[1] == 4 {
+            return HeartbeatPayload::from_tlv(b);
+        }
+
         if b.len() % 6 != 0 {
             return Err(anyhow!("Invalid amount of Relay path bytes"));
         }
@@ -645,14 +651,101 @@ impl HeartbeatPayload {
             })
             .collect();
 
-        Ok(HeartbeatPayload { relay_path })
+        Ok(HeartbeatPayload {
+            relay_path,
+            atx_path_cost: 0,
+            atx_depth: 0,
+        })
+    }
+
+    fn from_tlv(b: &[u8]) -> Result<Self> {
+        let mut atx_path_cost = 0;
+        let mut atx_depth = 0;
+        let mut relay_path = Vec::new();
+        let mut i = 0;
+
+        while i < b.len() {
+            if i + 2 > b.len() {
+                return Err(anyhow!("Truncated TLV"));
+            }
+
+            let t = b[i];
+            let l = b[i + 1] as usize;
+            i += 2;
+
+            if i + l > b.len() {
+                return Err(anyhow!("Invalid TLV length"));
+            }
+
+            match t {
+                0x01 => {
+                    if l != 4 {
+                        return Err(anyhow!("Invalid ATX path cost length"));
+                    }
+                    atx_path_cost = u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+                }
+                0x02 => {
+                    if l != 2 {
+                        return Err(anyhow!("Invalid ATX depth length"));
+                    }
+                    atx_depth = u16::from_be_bytes([b[i], b[i + 1]]);
+                }
+                0x03 => {
+                    if l % 6 != 0 {
+                        return Err(anyhow!("Invalid relay path length"));
+                    }
+
+                    relay_path = b[i..i + l]
+                        .chunks(6)
+                        .map(|v| {
+                            let mut b: [u8; 6] = [0; 6];
+                            b.copy_from_slice(v);
+                            RelayPath::from_bytes(b)
+                        })
+                        .collect();
+                }
+                _ => {
+                    return Err(anyhow!("Unknown Heartbeat TLV type"));
+                }
+            }
+
+            i += l;
+        }
+
+        Ok(HeartbeatPayload {
+            relay_path,
+            atx_path_cost,
+            atx_depth,
+        })
     }
 
     pub fn to_vec(&self) -> Result<Vec<u8>> {
-        let mut b = Vec::with_capacity(self.relay_path.len() * 6);
+        let mut relay_path_bytes = Vec::with_capacity(self.relay_path.len());
         for relay_path in &self.relay_path {
-            b.extend_from_slice(&relay_path.to_bytes()?);
+            relay_path_bytes.push(relay_path.to_bytes()?);
         }
+
+        let relay_path_len = relay_path_bytes.len() * 6;
+        if relay_path_len > u8::MAX as usize {
+            return Err(anyhow!("Relay path exceeds maximum TLV length"));
+        }
+
+        let mut b =
+            Vec::with_capacity(2 + 4 + 2 + relay_path_len + if relay_path_len > 0 { 2 } else { 0 });
+
+        b.extend_from_slice(&[0x01, 4]);
+        b.extend_from_slice(&self.atx_path_cost.to_be_bytes());
+
+        b.extend_from_slice(&[0x02, 2]);
+        b.extend_from_slice(&self.atx_depth.to_be_bytes());
+
+        if relay_path_len > 0 {
+            b.extend_from_slice(&[0x03, relay_path_len as u8]);
+            for chunk in relay_path_bytes {
+                b.extend_from_slice(&chunk);
+            }
+        }
+
         Ok(b)
     }
 }
@@ -1216,8 +1309,7 @@ mod test {
     #[test]
     fn test_uplink_payload_from_vec() {
         let b = vec![
-            0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
-            0x04, 0x05,
+            0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
         ];
         let up_pl = UplinkPayload::from_slice(&b).unwrap();
         assert_eq!(
@@ -1254,8 +1346,7 @@ mod test {
         let b = up_pl.to_vec().unwrap();
         assert_eq!(
             vec![
-                0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
-                0x03, 0x04, 0x05,
+                0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
             ],
             b
         );
@@ -1429,45 +1520,14 @@ mod test {
 
     #[test]
     fn test_event_heartbeat_payload_from_slice() {
-        let b = vec![
-            59, 154, 202, 0, 1, 2, 3, 4, 0, 12, 5, 6, 7, 8, 120, 52, 9, 10, 11, 12, 120, 52,
-        ];
-        let mut event_pl = EventPayload::from_slice(&b).unwrap();
-        event_pl.decode().unwrap();
-
-        assert_eq!(
-            EventPayload {
-                timestamp: UNIX_EPOCH
-                    .checked_add(Duration::from_secs(1_000_000_000))
-                    .unwrap(),
-                relay_id: [1, 2, 3, 4],
-                events: vec![Event::Heartbeat(HeartbeatPayload {
-                    relay_path: vec![
-                        RelayPath {
-                            relay_id: [5, 6, 7, 8],
-                            rssi: -120,
-                            snr: -12,
-                        },
-                        RelayPath {
-                            relay_id: [9, 10, 11, 12],
-                            rssi: -120,
-                            snr: -12,
-                        },
-                    ]
-                }),],
-            },
-            event_pl,
-        );
-    }
-
-    #[test]
-    fn test_heartbeat_payload_to_vec() {
         let event_pl = EventPayload {
             timestamp: UNIX_EPOCH
                 .checked_add(Duration::from_secs(1_000_000_000))
                 .unwrap(),
             relay_id: [1, 2, 3, 4],
             events: vec![Event::Heartbeat(HeartbeatPayload {
+                atx_path_cost: 513,
+                atx_depth: 12,
                 relay_path: vec![
                     RelayPath {
                         relay_id: [5, 6, 7, 8],
@@ -1483,9 +1543,67 @@ mod test {
             })],
         };
         let b = event_pl.to_vec().unwrap();
+        let mut decoded = EventPayload::from_slice(&b).unwrap();
+        decoded.decode().unwrap();
+        assert_eq!(event_pl, decoded);
+    }
+
+    #[test]
+    fn test_heartbeat_payload_to_vec() {
+        let hb = HeartbeatPayload {
+            atx_path_cost: 513,
+            atx_depth: 12,
+            relay_path: vec![
+                RelayPath {
+                    relay_id: [5, 6, 7, 8],
+                    rssi: -120,
+                    snr: -12,
+                },
+                RelayPath {
+                    relay_id: [9, 10, 11, 12],
+                    rssi: -120,
+                    snr: -12,
+                },
+            ],
+        };
+
         assert_eq!(
-            vec![59, 154, 202, 0, 1, 2, 3, 4, 0, 12, 5, 6, 7, 8, 120, 52, 9, 10, 11, 12, 120, 52],
-            b
+            vec![
+                1, 4, 0, 0, 2, 1, // cost TLV
+                2, 2, 0, 12, // depth TLV
+                3, 12, // relay path TLV header
+                5, 6, 7, 8, 120, 52, // first path entry
+                9, 10, 11, 12, 120, 52, // second path entry
+            ],
+            hb.to_vec().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_payload_from_slice_legacy() {
+        let legacy_bytes = vec![
+            5, 6, 7, 8, 120, 52, // first entry
+            9, 10, 11, 12, 120, 52, // second entry
+        ];
+
+        assert_eq!(
+            HeartbeatPayload {
+                atx_path_cost: 0,
+                atx_depth: 0,
+                relay_path: vec![
+                    RelayPath {
+                        relay_id: [5, 6, 7, 8],
+                        rssi: -120,
+                        snr: -12,
+                    },
+                    RelayPath {
+                        relay_id: [9, 10, 11, 12],
+                        rssi: -120,
+                        snr: -12,
+                    },
+                ],
+            },
+            HeartbeatPayload::from_slice(&legacy_bytes).unwrap()
         );
     }
 

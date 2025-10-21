@@ -8,7 +8,7 @@ use chirpstack_api::prost::Message;
 use zeromq::{SocketRecv, SocketSend};
 
 use chirpstack_gateway_mesh::aes128::{get_encryption_key, get_signing_key, Aes128Key};
-use chirpstack_gateway_mesh::packets;
+use chirpstack_gateway_mesh::{packets, routing};
 
 mod common;
 
@@ -19,6 +19,7 @@ mod common;
 #[tokio::test]
 async fn test_border_gateway_mesh_heartbeat() {
     common::setup(true).await;
+    routing::reset().await;
 
     let mut packet = packets::MeshPacket {
         mhdr: packets::MHDR {
@@ -29,6 +30,8 @@ async fn test_border_gateway_mesh_heartbeat() {
             relay_id: [2, 2, 2, 2],
             timestamp: UNIX_EPOCH,
             events: vec![packets::Event::Heartbeat(packets::HeartbeatPayload {
+                atx_path_cost: 1_234,
+                atx_depth: 9,
                 relay_path: vec![
                     packets::RelayPath {
                         relay_id: [1, 2, 3, 4],
@@ -125,4 +128,12 @@ async fn test_border_gateway_mesh_heartbeat() {
         },
         mesh_event
     );
+
+    let selector = routing::selector().await;
+    let metrics = selector
+        .neighbor_metrics(&[2, 2, 2, 2])
+        .await
+        .expect("neighbor metrics recorded");
+    assert_eq!(metrics.path_cost, 1_234);
+    assert_eq!(metrics.depth, 9);
 }

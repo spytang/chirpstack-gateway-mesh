@@ -5,7 +5,7 @@ extern crate anyhow;
 
 use chirpstack_api::gw;
 use chirpstack_api::prost::Message;
-use chirpstack_gateway_mesh::packets;
+use chirpstack_gateway_mesh::{packets, routing};
 use zeromq::SocketRecv;
 
 use chirpstack_gateway_mesh::aes128::{get_encryption_key, Aes128Key};
@@ -19,6 +19,15 @@ mod common;
 #[tokio::test]
 async fn test_relay_gateway_mesh_event_heartbeat() {
     common::setup(false).await;
+    routing::reset().await;
+    let selector = routing::selector().await;
+    selector
+        .set_local_route(Some(routing::RouteEntry {
+            path_cost: 321,
+            depth: 7,
+        }))
+        .await;
+
     let _ = events::report_heartbeat().await;
 
     // We expect the heartbeat to be received by the mesh concentratord as
@@ -70,7 +79,9 @@ async fn test_relay_gateway_mesh_event_heartbeat() {
                 relay_id: [2, 2, 2, 2],
                 timestamp: UNIX_EPOCH,
                 events: vec![packets::Event::Heartbeat(packets::HeartbeatPayload {
-                    relay_path: vec![]
+                    atx_path_cost: 321,
+                    atx_depth: 7,
+                    relay_path: vec![],
                 }),],
             }),
             mic: None,

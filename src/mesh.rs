@@ -18,7 +18,7 @@ use crate::{
         self, DownlinkMetadata, Event, MeshPacket, Payload, PayloadType, UplinkMetadata,
         UplinkPayload, MHDR,
     },
-    proxy,
+    proxy, routing,
 };
 
 static CTX_PREFIX: [u8; 3] = [1, 2, 3];
@@ -216,9 +216,10 @@ async fn proxy_uplink_mesh_packet(pl: &gw::UplinkFrame, packet: MeshPacket) -> R
         rx_info
             .metadata
             .insert("relay_id".to_string(), hex::encode(mesh_pl.relay_id));
-        rx_info
-            .metadata
-            .insert("uplink_id".to_string(), mesh_pl.metadata.uplink_id.to_string());
+        rx_info.metadata.insert(
+            "uplink_id".to_string(),
+            mesh_pl.metadata.uplink_id.to_string(),
+        );
 
         // Calculate mesh delay (in ms) and add to metadata.
         let delay = helpers::ms_since_midnight().saturating_sub(mesh_pl.timestamp);
@@ -270,6 +271,15 @@ async fn proxy_event_mesh_packet(pl: &gw::UplinkFrame, packet: MeshPacket) -> Re
         packet
     );
 
+    let selector = routing::selector().await;
+    for event in &mesh_pl.events {
+        if let Event::Heartbeat(hb) = event {
+            selector
+                .on_beacon(mesh_pl.relay_id, hb.atx_path_cost, hb.atx_depth)
+                .await;
+        }
+    }
+
     let event = gw::Event {
         event: Some(gw::event::Event::Mesh(gw::MeshEvent {
             gateway_id: hex::encode(backend::get_gateway_id().await?),
@@ -280,19 +290,9 @@ async fn proxy_event_mesh_packet(pl: &gw::UplinkFrame, packet: MeshPacket) -> Re
                 .iter()
                 .map(|e| gw::MeshEventItem {
                     event: Some(match e {
-                        Event::Heartbeat(v) => {
-                            gw::mesh_event_item::Event::Heartbeat(gw::MeshEventHeartbeat {
-                                relay_path: v
-                                    .relay_path
-                                    .iter()
-                                    .map(|v| gw::MeshEventHeartbeatRelayPath {
-                                        relay_id: hex::encode(v.relay_id),
-                                        rssi: v.rssi.into(),
-                                        snr: v.snr.into(),
-                                    })
-                                    .collect(),
-                            })
-                        }
+                        Event::Heartbeat(v) => gw::mesh_event_item::Event::Heartbeat(
+                            mesh_event_heartbeat_from_payload(v),
+                        ),
                         Event::Proprietary(v) => {
                             gw::mesh_event_item::Event::Proprietary(gw::MeshEventProprietary {
                                 event_type: v.0.into(),
@@ -318,6 +318,9 @@ async fn relay_mesh_packet(pl: &gw::UplinkFrame, mut packet: MeshPacket) -> Resu
         .rx_info
         .as_ref()
         .ok_or_else(|| anyhow!("rx_info is None"))?;
+
+    let selector = routing::selector().await;
+    let local_route = selector.local_route().await.unwrap_or_default();
 
     match &mut packet.payload {
         packets::Payload::Uplink(pl) => {
@@ -378,6 +381,8 @@ async fn relay_mesh_packet(pl: &gw::UplinkFrame, mut packet: MeshPacket) -> Resu
             for event in &mut pl.events {
                 // Add our Relay ID to the path in case of heartbeat event.
                 if let Event::Heartbeat(v) = event {
+                    v.atx_path_cost = local_route.path_cost;
+                    v.atx_depth = local_route.depth;
                     v.relay_path.push(packets::RelayPath {
                         relay_id,
                         rssi: rx_info.rssi as i16,
@@ -643,6 +648,42 @@ async fn relay_downlink_lora_packet(pl: &gw::DownlinkFrame) -> Result<gw::Downli
         items: tx_ack_items,
         ..Default::default()
     })
+}
+
+#[cfg(mesh_event_has_atx_metrics)]
+fn mesh_event_heartbeat_from_payload(
+    payload: &packets::HeartbeatPayload,
+) -> gw::MeshEventHeartbeat {
+    gw::MeshEventHeartbeat {
+        advertised_atx_path_cost: payload.atx_path_cost,
+        advertised_atx_depth: payload.atx_depth.into(),
+        relay_path: payload
+            .relay_path
+            .iter()
+            .map(|v| gw::MeshEventHeartbeatRelayPath {
+                relay_id: hex::encode(v.relay_id),
+                rssi: v.rssi.into(),
+                snr: v.snr.into(),
+            })
+            .collect(),
+    }
+}
+
+#[cfg(not(mesh_event_has_atx_metrics))]
+fn mesh_event_heartbeat_from_payload(
+    payload: &packets::HeartbeatPayload,
+) -> gw::MeshEventHeartbeat {
+    gw::MeshEventHeartbeat {
+        relay_path: payload
+            .relay_path
+            .iter()
+            .map(|v| gw::MeshEventHeartbeatRelayPath {
+                relay_id: hex::encode(v.relay_id),
+                rssi: v.rssi.into(),
+                snr: v.snr.into(),
+            })
+            .collect(),
+    }
 }
 
 pub fn get_mesh_frequency(conf: &Configuration) -> Result<u32> {
