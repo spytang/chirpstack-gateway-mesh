@@ -30,6 +30,8 @@ async fn test_relay_gateway_relay_mesh_heartbeat() {
             relay_id: [1, 2, 3, 4],
             timestamp: UNIX_EPOCH,
             events: vec![packets::Event::Heartbeat(packets::HeartbeatPayload {
+                atx_path_cost: 0,
+                atx_depth: 0,
                 relay_path: vec![],
             })],
         }),

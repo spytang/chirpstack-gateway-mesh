@@ -15,6 +15,7 @@ use crate::config::{self, Configuration};
 use crate::helpers;
 use crate::mesh::get_mesh_frequency;
 use crate::packets;
+use crate::routing;
 
 static COMMANDS: OnceCell<HashMap<u8, Vec<String>>> = OnceCell::const_new();
 
@@ -83,8 +84,13 @@ pub async fn setup(conf: &Configuration) -> Result<()> {
 
 pub async fn report_heartbeat() -> Result<()> {
     info!("Sending heartbeat event");
+    let selector = routing::selector().await;
+    let route = selector.local_route().await.unwrap_or_default();
+
     send_events(vec![packets::Event::Heartbeat(packets::HeartbeatPayload {
         relay_path: vec![],
+        atx_path_cost: route.path_cost,
+        atx_depth: route.depth,
     })])
     .await
 }
