@@ -20,6 +20,11 @@ pub struct Configuration {
     pub mappings: Mappings,
     pub events: Events,
     pub commands: Commands,
+    pub routing: RoutingConfig,
+    pub scheduler: SchedulerConfig,
+    pub ack_lite: AckLiteConfig,
+    pub jit: JitConfig,
+    pub phy: PhyConfig,
 }
 
 impl Configuration {
@@ -190,6 +195,121 @@ pub struct EventsSet {
 #[serde(default)]
 pub struct Commands {
     pub commands: HashMap<String, Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    pub metric: String,
+    pub hysteresis_ratio: f32,
+    pub trigger_delta_atx: f32,
+    pub trickle_min_ms: u32,
+    pub trickle_max_ms: u32,
+}
+
+impl RoutingConfig {
+    pub fn metric_is_atx(&self) -> bool {
+        self.metric.to_ascii_lowercase() == "atx"
+    }
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            metric: "etx".to_string(),
+            hysteresis_ratio: 0.15,
+            trigger_delta_atx: 0.1,
+            trickle_min_ms: 2_000,
+            trickle_max_ms: 120_000,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulerConfig {
+    pub mode: String,
+    pub quantum_scale: u32,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            mode: "fifo".to_string(),
+            quantum_scale: 50_000,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct AckLiteConfig {
+    pub enabled: bool,
+    pub retry: u8,
+    pub timeout_ms: u32,
+}
+
+impl Default for AckLiteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retry: 0,
+            timeout_ms: 120,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct JitConfig {
+    pub post_tx_rx_guard_ms: u32,
+}
+
+impl Default for JitConfig {
+    fn default() -> Self {
+        Self {
+            post_tx_rx_guard_ms: 10,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhyConfig {
+    pub allowed: Vec<PhyCapability>,
+}
+
+impl Default for PhyConfig {
+    fn default() -> Self {
+        Self {
+            allowed: vec![PhyCapability {
+                sf: 12,
+                cr_numerator: 4,
+                cr_denominator: 8,
+                bw_hz: 812_000,
+            }],
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[serde(default)]
+pub struct PhyCapability {
+    pub sf: u8,
+    pub cr_numerator: u8,
+    pub cr_denominator: u8,
+    pub bw_hz: u32,
+}
+
+impl Default for PhyCapability {
+    fn default() -> Self {
+        Self {
+            sf: 12,
+            cr_numerator: 4,
+            cr_denominator: 8,
+            bw_hz: 812_000,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
