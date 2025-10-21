@@ -44,6 +44,7 @@
   cmac = "0.7"
   aes = "0.8"
   chrono = { version = "0.4", default-features = false, features = ["clock"] }
+  thiserror = "1.0"
 
 [dev-dependencies]
   zeromq = "0.4"
