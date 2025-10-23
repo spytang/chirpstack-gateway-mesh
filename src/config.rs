@@ -69,6 +69,7 @@ pub struct Mesh {
     pub border_gateway: bool,
     pub border_gateway_ignore_direct_uplinks: bool,
     pub max_hop_count: u8,
+    pub ctp: CtpConfig,
 }
 
 impl Default for Mesh {
@@ -91,6 +92,34 @@ impl Default for Mesh {
             border_gateway: false,
             border_gateway_ignore_direct_uplinks: false,
             max_hop_count: 1,
+            ctp: CtpConfig::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct CtpConfig {
+    #[serde(with = "humantime_serde")]
+    pub beacon_min_interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub beacon_max_interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub neighbor_expiration: Duration,
+    pub cost_improvement_reset: f32,
+    pub inconsistency_margin: f32,
+    pub ewma_alpha: f32,
+}
+
+impl Default for CtpConfig {
+    fn default() -> Self {
+        CtpConfig {
+            beacon_min_interval: Duration::from_millis(64),
+            beacon_max_interval: Duration::from_secs(3600),
+            neighbor_expiration: Duration::from_secs(600),
+            cost_improvement_reset: 1.5,
+            inconsistency_margin: 1.0,
+            ewma_alpha: 0.25,
         }
     }
 }
@@ -149,7 +178,7 @@ pub struct Mappings {
     pub data_rates: Vec<DataRate>,
 }
 
-#[derive(Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(default)]
 pub struct DataRate {
     pub modulation: Modulation,
