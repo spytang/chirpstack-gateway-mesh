@@ -327,8 +327,18 @@ impl RouteInfo {
 
         let mut parent: [u8; 4] = [0; 4];
         parent.copy_from_slice(&b[0..4]);
-        let path_metric = Metric(u16::from_be_bytes([b[4], b[5]]));
-        let link_metric = Metric(u16::from_be_bytes([b[6], b[7]]));
+        let raw_path_metric = u16::from_be_bytes([b[4], b[5]]);
+        let raw_link_metric = u16::from_be_bytes([b[6], b[7]]);
+        let path_metric = if raw_path_metric == u16::MAX {
+            Metric(0)
+        } else {
+            Metric(raw_path_metric)
+        };
+        let link_metric = if raw_link_metric == u16::MAX {
+            Metric(0)
+        } else {
+            Metric(raw_link_metric)
+        };
         let link_toa_ms = u16::from_be_bytes([b[8], b[9]]);
 
         Ok(RouteInfo {
@@ -348,8 +358,18 @@ impl RouteInfo {
         if let Some(parent) = self.parent {
             b[0..4].copy_from_slice(&parent);
         }
-        b[4..6].copy_from_slice(&self.path_metric.0.to_be_bytes());
-        b[6..8].copy_from_slice(&self.link_metric.0.to_be_bytes());
+        let path_metric = if self.path_metric.0 == 0 {
+            u16::MAX
+        } else {
+            self.path_metric.0
+        };
+        let link_metric = if self.link_metric.0 == 0 {
+            u16::MAX
+        } else {
+            self.link_metric.0
+        };
+        b[4..6].copy_from_slice(&path_metric.to_be_bytes());
+        b[6..8].copy_from_slice(&link_metric.to_be_bytes());
         b[8..10].copy_from_slice(&self.link_toa_ms.to_be_bytes());
         b
     }
