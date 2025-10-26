@@ -34,6 +34,7 @@ async fn test_border_gateway_uplink_mesh() {
             },
             timestamp: 0,
             relay_id: [1, 2, 3, 4],
+            route: Default::default(),
             phy_payload: vec![9, 8, 7, 6],
         }),
         mic: None,

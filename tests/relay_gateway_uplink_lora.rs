@@ -101,6 +101,7 @@ async fn test_relay_gateway_uplink_lora() {
                     },
                     timestamp: ts,
                     relay_id: [2, 2, 2, 2],
+                    route: Default::default(),
                     phy_payload: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 }),
                 mic: None,

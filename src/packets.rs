@@ -274,13 +274,14 @@ pub struct UplinkPayload {
     pub metadata: UplinkMetadata,
     pub timestamp: u32,
     pub relay_id: [u8; 4],
+    pub route: RouteInfo,
     pub phy_payload: Vec<u8>,
 }
 
 impl UplinkPayload {
     pub fn from_slice(b: &[u8]) -> Result<UplinkPayload> {
-        if b.len() < 13 {
-            return Err(anyhow!("At least 13 bytes are expected"));
+        if b.len() < 23 {
+            return Err(anyhow!("At least 23 bytes are expected"));
         }
 
         let mut md = [0; 5];
@@ -289,11 +290,14 @@ impl UplinkPayload {
         let mut gw_id = [0; 4];
         gw_id.copy_from_slice(&b[9..13]);
 
+        let route = RouteInfo::from_slice(&b[13..23])?;
+
         Ok(UplinkPayload {
             metadata: UplinkMetadata::from_bytes(md),
             timestamp,
             relay_id: gw_id,
-            phy_payload: b[13..].to_vec(),
+            route,
+            phy_payload: b[23..].to_vec(),
         })
     }
 
@@ -301,8 +305,127 @@ impl UplinkPayload {
         let mut b = self.metadata.to_bytes()?.to_vec();
         b.extend_from_slice(&self.timestamp.to_be_bytes());
         b.extend_from_slice(&self.relay_id);
+        b.extend_from_slice(&self.route.to_bytes());
         b.extend_from_slice(&self.phy_payload);
         Ok(b)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct RouteInfo {
+    pub parent: Option<[u8; 4]>,
+    pub path_metric: Metric,
+    pub link_metric: Metric,
+    pub link_toa_ms: u16,
+}
+
+impl RouteInfo {
+    pub fn from_slice(b: &[u8]) -> Result<Self> {
+        if b.len() < 10 {
+            return Err(anyhow!("At least 10 bytes are required for RouteInfo"));
+        }
+
+        let mut parent: [u8; 4] = [0; 4];
+        parent.copy_from_slice(&b[0..4]);
+        let raw_path_metric = u16::from_be_bytes([b[4], b[5]]);
+        let raw_link_metric = u16::from_be_bytes([b[6], b[7]]);
+        let path_metric = if raw_path_metric == u16::MAX {
+            Metric(0)
+        } else {
+            Metric(raw_path_metric)
+        };
+        let link_metric = if raw_link_metric == u16::MAX {
+            Metric(0)
+        } else {
+            Metric(raw_link_metric)
+        };
+        let link_toa_ms = u16::from_be_bytes([b[8], b[9]]);
+
+        Ok(RouteInfo {
+            parent: if parent.iter().all(|v| *v == 0) {
+                None
+            } else {
+                Some(parent)
+            },
+            path_metric,
+            link_metric,
+            link_toa_ms,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 10] {
+        let mut b = [0u8; 10];
+        if let Some(parent) = self.parent {
+            b[0..4].copy_from_slice(&parent);
+        }
+        let path_metric = if self.path_metric.0 == 0 {
+            u16::MAX
+        } else {
+            self.path_metric.0
+        };
+        let link_metric = if self.link_metric.0 == 0 {
+            u16::MAX
+        } else {
+            self.link_metric.0
+        };
+        b[4..6].copy_from_slice(&path_metric.to_be_bytes());
+        b[6..8].copy_from_slice(&link_metric.to_be_bytes());
+        b[8..10].copy_from_slice(&self.link_toa_ms.to_be_bytes());
+        b
+    }
+}
+
+impl Default for RouteInfo {
+    fn default() -> Self {
+        RouteInfo {
+            parent: None,
+            path_metric: Metric(0),
+            link_metric: Metric(0),
+            link_toa_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct Metric(pub u16);
+
+impl Metric {
+    pub const INFINITY: Metric = Metric(u16::MAX);
+
+    pub fn from_f32(value: f32) -> Metric {
+        if !value.is_finite() {
+            return Metric::INFINITY;
+        }
+
+        let scaled = (value * 256.0).round();
+        if scaled.is_sign_negative() {
+            Metric(0)
+        } else if scaled >= u16::MAX as f32 {
+            Metric::INFINITY
+        } else {
+            Metric(scaled as u16)
+        }
+    }
+
+    pub fn to_f32(self) -> f32 {
+        if self.0 == u16::MAX {
+            f32::INFINITY
+        } else {
+            (self.0 as f32) / 256.0
+        }
+    }
+
+    pub fn saturating_add(self, other: Metric) -> Metric {
+        if self.0 == u16::MAX || other.0 == u16::MAX {
+            Metric::INFINITY
+        } else {
+            let sum = self.0.saturating_add(other.0);
+            if sum == u16::MAX {
+                Metric::INFINITY
+            } else {
+                Metric(sum)
+            }
+        }
     }
 }
 
@@ -592,6 +715,7 @@ impl EventPayload {
 pub enum Event {
     Encrypted(Vec<u8>),
     Heartbeat(HeartbeatPayload),
+    RoutingBeacon(RoutingBeaconPayload),
     Proprietary((u8, Vec<u8>)),
 }
 
@@ -605,6 +729,7 @@ impl Event {
 
         Ok(match tag_length[0] {
             0x00 => Event::Heartbeat(HeartbeatPayload::from_slice(&value)?),
+            0x01 => Event::RoutingBeacon(RoutingBeaconPayload::from_slice(&value)?),
             _ => Event::Proprietary((tag_length[0], value)),
         })
     }
@@ -613,6 +738,7 @@ impl Event {
         let (t, v) = match self {
             Event::Encrypted(v) => return Ok(v.clone()),
             Event::Heartbeat(v) => (0x00, v.to_vec()?),
+            Event::RoutingBeacon(v) => (0x01, v.to_vec()?),
             Event::Proprietary((t, v)) => (*t, v.clone()),
         };
 
@@ -655,6 +781,134 @@ impl HeartbeatPayload {
         }
         Ok(b)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutingBeaconFlags(pub u8);
+
+impl RoutingBeaconFlags {
+    pub const PULL: RoutingBeaconFlags = RoutingBeaconFlags(0x01);
+
+    pub fn empty() -> Self {
+        RoutingBeaconFlags(0)
+    }
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub fn contains(self, other: RoutingBeaconFlags) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub fn union(self, other: RoutingBeaconFlags) -> RoutingBeaconFlags {
+        RoutingBeaconFlags(self.0 | other.0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct RoutingBeaconPayload {
+    pub flags: RoutingBeaconFlags,
+    pub parent: Option<[u8; 4]>,
+    pub path_metric: Metric,
+    pub neighbors: Vec<RoutingNeighborEntry>,
+}
+
+impl RoutingBeaconPayload {
+    pub fn from_slice(b: &[u8]) -> Result<Self> {
+        if b.len() < 8 {
+            return Err(anyhow!("At least 8 bytes are required for RoutingBeacon"));
+        }
+
+        let flags = RoutingBeaconFlags(b[0]);
+        let path_metric = Metric(u16::from_be_bytes([b[1], b[2]]));
+        let mut parent: [u8; 4] = [0; 4];
+        parent.copy_from_slice(&b[3..7]);
+        let neighbors_len = b[7] as usize;
+        let expected = 8 + neighbors_len * 6;
+        if b.len() < expected {
+            return Err(anyhow!("RoutingBeacon neighbor payload is truncated"));
+        }
+
+        let mut neighbors = Vec::with_capacity(neighbors_len);
+        for chunk in b[8..expected].chunks_exact(6) {
+            let mut neighbor_id = [0u8; 4];
+            neighbor_id.copy_from_slice(&chunk[0..4]);
+            neighbors.push(RoutingNeighborEntry {
+                neighbor_id,
+                forward_delivery: chunk[4],
+                spreading_factor: chunk[5],
+            });
+        }
+
+        Ok(RoutingBeaconPayload {
+            flags,
+            parent: if parent.iter().all(|v| *v == 0) {
+                None
+            } else {
+                Some(parent)
+            },
+            path_metric,
+            neighbors,
+        })
+    }
+
+    pub fn to_vec(&self) -> Result<Vec<u8>> {
+        if self.neighbors.len() > u8::MAX as usize {
+            return Err(anyhow!("Too many neighbors for RoutingBeacon"));
+        }
+
+        let mut b = Vec::with_capacity(8 + self.neighbors.len() * 6);
+        b.push(self.flags.bits());
+        b.extend_from_slice(&self.path_metric.0.to_be_bytes());
+        if let Some(parent) = self.parent {
+            b.extend_from_slice(&parent);
+        } else {
+            b.extend_from_slice(&[0u8; 4]);
+        }
+        b.push(self.neighbors.len() as u8);
+        for neighbor in &self.neighbors {
+            b.extend_from_slice(&neighbor.neighbor_id);
+            b.push(neighbor.forward_delivery);
+            b.push(neighbor.spreading_factor);
+        }
+
+        Ok(b)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct RoutingNeighborEntry {
+    pub neighbor_id: [u8; 4],
+    pub forward_delivery: u8,
+    pub spreading_factor: u8,
+}
+
+impl RoutingNeighborEntry {
+    pub fn with_delivery(neighbor_id: [u8; 4], delivery: f32, spreading_factor: u8) -> Self {
+        RoutingNeighborEntry {
+            neighbor_id,
+            forward_delivery: encode_delivery(delivery),
+            spreading_factor,
+        }
+    }
+
+    pub fn delivery(&self) -> f32 {
+        decode_delivery(self.forward_delivery)
+    }
+}
+
+fn encode_delivery(delivery: f32) -> u8 {
+    let delivery = if delivery.is_nan() {
+        0.0
+    } else {
+        delivery.clamp(0.0, 1.0)
+    };
+    (delivery * 255.0).round() as u8
+}
+
+fn decode_delivery(value: u8) -> f32 {
+    (value as f32) / 255.0
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1216,8 +1470,8 @@ mod test {
     #[test]
     fn test_uplink_payload_from_vec() {
         let b = vec![
-            0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
-            0x04, 0x05,
+            0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x00,
+            0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x05,
         ];
         let up_pl = UplinkPayload::from_slice(&b).unwrap();
         assert_eq!(
@@ -1231,6 +1485,7 @@ mod test {
                 },
                 timestamp: 0,
                 relay_id: [0x01, 0x02, 0x03, 0x04],
+                route: RouteInfo::default(),
                 phy_payload: vec![0x05],
             },
             up_pl,
@@ -1249,13 +1504,14 @@ mod test {
             },
             timestamp: 0,
             relay_id: [0x01, 0x02, 0x03, 0x04],
+            route: RouteInfo::default(),
             phy_payload: vec![0x05],
         };
         let b = up_pl.to_vec().unwrap();
         assert_eq!(
             vec![
-                0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
-                0x03, 0x04, 0x05,
+                0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x00,
+                0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x05,
             ],
             b
         );
@@ -1533,7 +1789,8 @@ mod test {
                 name: "uplink".into(),
                 bytes: vec![
                     0xe2, 0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
-                    0x04, 0x05, 0x01, 0x02, 0x03, 0x04,
+                    0x04, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x05, 0x01,
+                    0x02, 0x03, 0x04,
                 ],
                 expected_mesh_packet: MeshPacket {
                     mhdr: MHDR {
@@ -1550,6 +1807,7 @@ mod test {
                         },
                         timestamp: 0,
                         relay_id: [0x01, 0x02, 0x03, 0x04],
+                        route: RouteInfo::default(),
                         phy_payload: vec![0x05],
                     }),
                     mic: Some([0x01, 0x02, 0x03, 0x04]),
@@ -1602,7 +1860,8 @@ mod test {
                 name: "uplink".into(),
                 expected_bytes: vec![
                     0xe2, 0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
-                    0x04, 0x05, 0x01, 0x02, 0x03, 0x04,
+                    0x04, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x05, 0x01,
+                    0x02, 0x03, 0x04,
                 ],
                 mesh_packet: MeshPacket {
                     mhdr: MHDR {
@@ -1619,6 +1878,7 @@ mod test {
                         },
                         timestamp: 0,
                         relay_id: [0x01, 0x02, 0x03, 0x04],
+                        route: RouteInfo::default(),
                         phy_payload: vec![0x05],
                     }),
                     mic: Some([0x01, 0x02, 0x03, 0x04]),
@@ -1671,7 +1931,8 @@ mod test {
                 name: "mesh packet".into(),
                 bytes: vec![
                     0xe2, 0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
-                    0x04, 0x05, 0x01, 0x02, 0x03, 0x04,
+                    0x04, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x05, 0x01,
+                    0x02, 0x03, 0x04,
                 ],
                 expected_packet: Packet::Mesh(MeshPacket {
                     mhdr: MHDR {
@@ -1688,6 +1949,7 @@ mod test {
                         },
                         timestamp: 0,
                         relay_id: [0x01, 0x02, 0x03, 0x04],
+                        route: RouteInfo::default(),
                         phy_payload: vec![0x05],
                     }),
                     mic: Some([0x01, 0x02, 0x03, 0x04]),
@@ -1720,7 +1982,8 @@ mod test {
                 name: "mesh packet".into(),
                 expected_bytes: vec![
                     0xe2, 0x40, 0x03, 0x78, 0x34, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
-                    0x04, 0x05, 0x01, 0x02, 0x03, 0x04,
+                    0x04, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x05, 0x01,
+                    0x02, 0x03, 0x04,
                 ],
                 packet: Packet::Mesh(MeshPacket {
                     mhdr: MHDR {
@@ -1737,6 +2000,7 @@ mod test {
                         },
                         timestamp: 0,
                         relay_id: [0x01, 0x02, 0x03, 0x04],
+                        route: RouteInfo::default(),
                         phy_payload: vec![0x05],
                     }),
                     mic: Some([0x01, 0x02, 0x03, 0x04]),

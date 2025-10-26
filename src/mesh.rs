@@ -4,9 +4,13 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use chirpstack_api::{gw, prost_types};
-use log::{info, trace, warn};
+use log::{debug, info, trace, warn};
 use rand::random;
 
+mod ctp;
+mod scheduler;
+
+use self::ctp::RoutingDecision;
 use crate::{
     aes128::{get_encryption_key, get_signing_key, Aes128Key},
     backend,
@@ -15,11 +19,13 @@ use crate::{
     config::{self, Configuration},
     events, helpers,
     packets::{
-        self, DownlinkMetadata, Event, MeshPacket, Payload, PayloadType, UplinkMetadata,
-        UplinkPayload, MHDR,
+        self, DownlinkMetadata, Event, EventPayload, MeshPacket, Metric, Payload, PayloadType,
+        RouteInfo, RoutingBeaconPayload, UplinkMetadata, UplinkPayload, MHDR,
     },
     proxy,
 };
+
+use scheduler::TxPlan;
 
 static CTX_PREFIX: [u8; 3] = [1, 2, 3];
 static MESH_CHANNEL: Mutex<usize> = Mutex::new(0);
@@ -28,6 +34,11 @@ static UPLINK_CONTEXT: LazyLock<Mutex<HashMap<u16, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PAYLOAD_CACHE: LazyLock<Mutex<Cache<PayloadCache>>> =
     LazyLock::new(|| Mutex::new(Cache::new(64)));
+
+pub async fn setup(conf: &Configuration) -> Result<()> {
+    scheduler::init();
+    ctp::setup(conf).await
+}
 
 // Handle LoRaWAN payload (non-proprietary).
 pub async fn handle_uplink(border_gateway: bool, pl: &gw::UplinkFrame) -> Result<()> {
@@ -216,9 +227,27 @@ async fn proxy_uplink_mesh_packet(pl: &gw::UplinkFrame, packet: MeshPacket) -> R
         rx_info
             .metadata
             .insert("relay_id".to_string(), hex::encode(mesh_pl.relay_id));
-        rx_info
-            .metadata
-            .insert("uplink_id".to_string(), mesh_pl.metadata.uplink_id.to_string());
+        rx_info.metadata.insert(
+            "uplink_id".to_string(),
+            mesh_pl.metadata.uplink_id.to_string(),
+        );
+        if let Some(parent) = mesh_pl.route.parent {
+            rx_info
+                .metadata
+                .insert("ctp_parent".to_string(), hex::encode(parent));
+        }
+        rx_info.metadata.insert(
+            "ctp_path_metric".to_string(),
+            format!("{:.2}", mesh_pl.route.path_metric.to_f32()),
+        );
+        rx_info.metadata.insert(
+            "ctp_link_metric".to_string(),
+            format!("{:.2}", mesh_pl.route.link_metric.to_f32()),
+        );
+        rx_info.metadata.insert(
+            "ctp_link_toa_ms".to_string(),
+            mesh_pl.route.link_toa_ms.to_string(),
+        );
 
         // Calculate mesh delay (in ms) and add to metadata.
         let delay = helpers::ms_since_midnight().saturating_sub(mesh_pl.timestamp);
@@ -278,10 +307,11 @@ async fn proxy_event_mesh_packet(pl: &gw::UplinkFrame, packet: MeshPacket) -> Re
             events: mesh_pl
                 .events
                 .iter()
-                .map(|e| gw::MeshEventItem {
-                    event: Some(match e {
-                        Event::Heartbeat(v) => {
-                            gw::mesh_event_item::Event::Heartbeat(gw::MeshEventHeartbeat {
+                .filter_map(|e| match e {
+                    Event::RoutingBeacon(_) => None,
+                    Event::Heartbeat(v) => Some(gw::MeshEventItem {
+                        event: Some(gw::mesh_event_item::Event::Heartbeat(
+                            gw::MeshEventHeartbeat {
                                 relay_path: v
                                     .relay_path
                                     .iter()
@@ -291,16 +321,18 @@ async fn proxy_event_mesh_packet(pl: &gw::UplinkFrame, packet: MeshPacket) -> Re
                                         snr: v.snr.into(),
                                     })
                                     .collect(),
-                            })
-                        }
-                        Event::Proprietary(v) => {
-                            gw::mesh_event_item::Event::Proprietary(gw::MeshEventProprietary {
+                            },
+                        )),
+                    }),
+                    Event::Proprietary(v) => Some(gw::MeshEventItem {
+                        event: Some(gw::mesh_event_item::Event::Proprietary(
+                            gw::MeshEventProprietary {
                                 event_type: v.0.into(),
                                 payload: v.1.clone(),
-                            })
-                        }
-                        Event::Encrypted(_) => panic!("Events must be decrypted first"),
+                            },
+                        )),
                     }),
+                    Event::Encrypted(_) => panic!("Events must be decrypted first"),
                 })
                 .collect(),
         })),
@@ -319,87 +351,181 @@ async fn relay_mesh_packet(pl: &gw::UplinkFrame, mut packet: MeshPacket) -> Resu
         .as_ref()
         .ok_or_else(|| anyhow!("rx_info is None"))?;
 
-    match &mut packet.payload {
-        packets::Payload::Uplink(pl) => {
-            if pl.relay_id == relay_id {
-                trace!("Dropping packet as this relay was the sender");
+    let mut forward_uplink: Option<(RoutingDecision, [u8; 4])> = None;
 
-                // Drop the packet, as we are the original sender.
-                return Ok(());
-            }
-        }
-        packets::Payload::Downlink(pl) => {
-            if pl.relay_id == relay_id {
-                // We must unwrap the mesh encapsulated packet and send it to the
-                // End Device.
+    {
+        let payload = &mut packet.payload;
+        match payload {
+            packets::Payload::Uplink(uplink_pl) => {
+                if uplink_pl.relay_id == relay_id {
+                    trace!("Dropping packet as this relay was the sender");
 
-                let pl = gw::DownlinkFrame {
-                    downlink_id: random(),
-                    items: vec![gw::DownlinkFrameItem {
-                        phy_payload: pl.phy_payload.clone(),
-                        tx_info: Some(gw::DownlinkTxInfo {
-                            frequency: pl.metadata.frequency,
-                            power: helpers::index_to_tx_power(pl.metadata.tx_power)?,
-                            timing: Some(gw::Timing {
-                                parameters: Some(gw::timing::Parameters::Delay(
-                                    gw::DelayTimingInfo {
-                                        delay: Some(prost_types::Duration {
-                                            seconds: pl.metadata.delay.into(),
-                                            ..Default::default()
-                                        }),
-                                    },
-                                )),
-                            }),
-                            modulation: Some(helpers::dr_to_modulation(pl.metadata.dr, true)?),
-                            context: get_uplink_context(pl.metadata.uplink_id)?,
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }],
-                    gateway_id: hex::encode(backend::get_gateway_id().await?),
-                    ..Default::default()
+                    // Drop the packet, as we are the original sender.
+                    return Ok(());
+                }
+
+                let expected_parent = match uplink_pl.route.parent {
+                    Some(parent) => parent,
+                    None => {
+                        trace!("Dropping uplink without parent assignment");
+                        return Ok(());
+                    }
                 };
 
-                info!(
-                    "Unwrapping relayed downlink, downlink_id: {}, mesh_packet: {}",
-                    pl.downlink_id, packet
-                );
-                return helpers::tx_ack_to_err(&backend::send_downlink(pl).await?);
-            }
-        }
-        packets::Payload::Event(pl) => {
-            if pl.relay_id == relay_id {
-                trace!("Dropping packet as this relay was the sender");
+                if expected_parent != relay_id {
+                    trace!(
+                        "Dropping uplink because this relay is not the selected parent, expected_parent: {}",
+                        hex::encode(expected_parent)
+                    );
+                    return Ok(());
+                }
 
-                // Drop the packet, as we are the sender.
-                return Ok(());
-            }
+                let child_metric = uplink_pl.route.path_metric.to_f32();
+                ctp::notify_inconsistency(child_metric).await;
 
-            for event in &mut pl.events {
-                // Add our Relay ID to the path in case of heartbeat event.
-                if let Event::Heartbeat(v) = event {
-                    v.relay_path.push(packets::RelayPath {
-                        relay_id,
-                        rssi: rx_info.rssi as i16,
-                        snr: rx_info.snr as i8,
-                    });
+                let decision = match ctp::prepare_forward(uplink_pl.relay_id, child_metric).await {
+                    Some(v) => v,
+                    None => {
+                        warn!(
+                            "No upstream parent available for child {}, requesting new beacons",
+                            hex::encode(uplink_pl.relay_id)
+                        );
+                        ctp::notify_pull_request().await;
+                        return Ok(());
+                    }
+                };
+
+                uplink_pl.route.parent = Some(decision.parent);
+                uplink_pl.route.path_metric = Metric::from_f32(decision.path_metric);
+                uplink_pl.route.link_metric = Metric::from_f32(decision.link_metric);
+                uplink_pl.route.link_toa_ms = decision.toa.as_millis() as u16;
+
+                forward_uplink = Some((decision, uplink_pl.relay_id));
+            }
+            packets::Payload::Downlink(downlink_pl) => {
+                if downlink_pl.relay_id == relay_id {
+                    // We must unwrap the mesh encapsulated packet and send it to the
+                    // End Device.
+
+                    let downlink = gw::DownlinkFrame {
+                        downlink_id: random(),
+                        items: vec![gw::DownlinkFrameItem {
+                            phy_payload: downlink_pl.phy_payload.clone(),
+                            tx_info: Some(gw::DownlinkTxInfo {
+                                frequency: downlink_pl.metadata.frequency,
+                                power: helpers::index_to_tx_power(downlink_pl.metadata.tx_power)?,
+                                timing: Some(gw::Timing {
+                                    parameters: Some(gw::timing::Parameters::Delay(
+                                        gw::DelayTimingInfo {
+                                            delay: Some(prost_types::Duration {
+                                                seconds: downlink_pl.metadata.delay.into(),
+                                                ..Default::default()
+                                            }),
+                                        },
+                                    )),
+                                }),
+                                modulation: Some(helpers::dr_to_modulation(
+                                    downlink_pl.metadata.dr,
+                                    true,
+                                )?),
+                                context: get_uplink_context(downlink_pl.metadata.uplink_id)?,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        gateway_id: hex::encode(backend::get_gateway_id().await?),
+                        ..Default::default()
+                    };
+
+                    info!(
+                        "Unwrapping relayed downlink, downlink_id: {}, mesh_packet: {}",
+                        downlink.downlink_id, packet
+                    );
+                    return helpers::tx_ack_to_err(&backend::send_downlink(downlink).await?);
+                }
+            }
+            packets::Payload::Event(event_pl) => {
+                if event_pl.relay_id == relay_id {
+                    trace!("Dropping packet as this relay was the sender");
+
+                    // Drop the packet, as we are the sender.
+                    return Ok(());
+                }
+
+                let mut events_to_forward = Vec::new();
+                for event in event_pl.events.drain(..) {
+                    match event {
+                        Event::Heartbeat(mut hb) => {
+                            hb.relay_path.push(packets::RelayPath {
+                                relay_id,
+                                rssi: rx_info.rssi as i16,
+                                snr: rx_info.snr as i8,
+                            });
+                            events_to_forward.push(Event::Heartbeat(hb));
+                        }
+                        Event::RoutingBeacon(beacon) => {
+                            ctp::handle_beacon(event_pl.relay_id, &beacon).await;
+                        }
+                        other => {
+                            events_to_forward.push(other);
+                        }
+                    }
+                }
+
+                event_pl.events = events_to_forward;
+
+                if event_pl.events.is_empty() {
+                    trace!("Dropping event packet as there is nothing to forward");
+                    return Ok(());
+                }
+            }
+            packets::Payload::Command(command_pl) => {
+                if command_pl.relay_id == relay_id {
+                    // The command payload was intended for this gateway, execute
+                    // the commands.
+                    let resp = commands::execute_commands(command_pl).await?;
+
+                    // Send back the responses (events).
+                    if !resp.is_empty() {
+                        events::send_events(resp).await?;
+                    }
+
+                    return Ok(());
                 }
             }
         }
-        packets::Payload::Command(pl) => {
-            if pl.relay_id == relay_id {
-                // The command payload was intended for this gateway, execute
-                // the commands.
-                let resp = commands::execute_commands(pl).await?;
+    }
 
-                // Send back the responses (events).
-                if !resp.is_empty() {
-                    events::send_events(resp).await?;
-                }
+    if let Some((decision, child_relay_id)) = forward_uplink {
+        packet.mhdr.hop_count += 1;
 
-                return Ok(());
-            }
+        if packet.mhdr.hop_count > conf.mesh.max_hop_count {
+            return Err(anyhow!("Max hop count exceeded"));
         }
+
+        packet.set_mic(if conf.mesh.signing_key != Aes128Key::null() {
+            conf.mesh.signing_key
+        } else {
+            get_signing_key(conf.mesh.root_key)
+        })?;
+
+        info!(
+            "Forwarding mesh uplink from {}, next_hop: {}, metric: {:.2}",
+            hex::encode(child_relay_id),
+            hex::encode(decision.parent),
+            decision.path_metric
+        );
+
+        scheduler::enqueue(
+            packet,
+            decision.plan(),
+            child_relay_id,
+            Some(decision.parent),
+            true,
+        )
+        .await;
+
+        return Ok(());
     }
 
     // In any other case, we increment the hop_count and re-transmit the mesh encapsulated
@@ -469,6 +595,20 @@ async fn relay_uplink_lora_packet(pl: &gw::UplinkFrame) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("modulation is None"))?;
 
+    let decision = match ctp::prepare_uplink().await {
+        Some(v) => v,
+        None => {
+            warn!(
+                "No routing parent available, requesting neighbors to advertise, uplink_id: {}",
+                rx_info.uplink_id
+            );
+            ctp::notify_pull_request().await;
+            return Ok(());
+        }
+    };
+
+    let relay_id = backend::get_relay_id().await?;
+
     let mut packet = MeshPacket {
         mhdr: MHDR {
             payload_type: PayloadType::Uplink,
@@ -483,7 +623,13 @@ async fn relay_uplink_lora_packet(pl: &gw::UplinkFrame) -> Result<()> {
                 snr: rx_info.snr as i8,
             },
             timestamp: helpers::ms_since_midnight(),
-            relay_id: backend::get_relay_id().await?,
+            relay_id,
+            route: RouteInfo {
+                parent: Some(decision.parent),
+                path_metric: Metric::from_f32(decision.path_metric),
+                link_metric: Metric::from_f32(decision.link_metric),
+                link_toa_ms: decision.toa.as_millis() as u16,
+            },
             phy_payload: pl.phy_payload.clone(),
         }),
         mic: None,
@@ -493,36 +639,23 @@ async fn relay_uplink_lora_packet(pl: &gw::UplinkFrame) -> Result<()> {
     } else {
         get_signing_key(conf.mesh.root_key)
     })?;
-
-    let pl = gw::DownlinkFrame {
-        downlink_id: random(),
-        items: vec![gw::DownlinkFrameItem {
-            phy_payload: packet.to_vec()?,
-            tx_info: Some(gw::DownlinkTxInfo {
-                frequency: get_mesh_frequency(&conf)?,
-                power: conf.mesh.tx_power,
-                modulation: Some(helpers::data_rate_to_gw_modulation(
-                    &conf.mesh.data_rate,
-                    false,
-                )),
-                timing: Some(gw::Timing {
-                    parameters: Some(gw::timing::Parameters::Immediately(
-                        gw::ImmediatelyTimingInfo {},
-                    )),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
     info!(
-        "Relaying uplink LoRa frame, uplink_id: {}, downlink_id: {}, mesh_packet: {}",
-        rx_info.uplink_id, pl.downlink_id, packet,
+        "Scheduling uplink for mesh forwarding, uplink_id: {}, parent: {}, metric: {:.2}",
+        rx_info.uplink_id,
+        hex::encode(decision.parent),
+        decision.path_metric
     );
 
-    backend::mesh(pl).await
+    scheduler::enqueue(
+        packet,
+        decision.plan(),
+        relay_id,
+        Some(decision.parent),
+        true,
+    )
+    .await;
+
+    Ok(())
 }
 
 async fn relay_downlink_lora_packet(pl: &gw::DownlinkFrame) -> Result<gw::DownlinkTxAck> {
@@ -684,4 +817,41 @@ fn get_uplink_context(uplink_id: u16) -> Result<Vec<u8>> {
         .get(&uplink_id)
         .cloned()
         .ok_or_else(|| anyhow!("No uplink context for uplink_id: {}", uplink_id))
+}
+
+pub(super) async fn enqueue_beacon(payload: RoutingBeaconPayload) -> Result<()> {
+    let conf = config::get();
+    let relay_id = backend::get_relay_id().await?;
+
+    let event_payload = EventPayload {
+        timestamp: SystemTime::now(),
+        relay_id,
+        events: vec![Event::RoutingBeacon(payload)],
+    };
+
+    let mut packet = MeshPacket {
+        mhdr: MHDR {
+            payload_type: PayloadType::Event,
+            hop_count: 1,
+        },
+        payload: Payload::Event(event_payload),
+        mic: None,
+    };
+
+    packet.set_mic(if conf.mesh.signing_key != Aes128Key::null() {
+        conf.mesh.signing_key
+    } else {
+        get_signing_key(conf.mesh.root_key)
+    })?;
+
+    let plan = TxPlan {
+        data_rate: conf.mesh.data_rate.clone(),
+        toa: ctp::toa_for_sf(conf.mesh.data_rate.spreading_factor),
+    };
+
+    debug!("Queueing routing beacon for broadcast");
+
+    scheduler::enqueue(packet, plan, scheduler::BEACON_FLOW_ID, None, false).await;
+
+    Ok(())
 }

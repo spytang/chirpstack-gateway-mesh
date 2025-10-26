@@ -4,11 +4,12 @@ use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
 
 use crate::config::Configuration;
-use crate::{backend, commands, events, proxy};
+use crate::{backend, commands, events, mesh, proxy};
 
 pub async fn run(conf: &Configuration) -> Result<()> {
     proxy::setup(conf).await?;
     backend::setup(conf).await?;
+    mesh::setup(conf).await?;
     events::setup(conf).await?;
     commands::setup(conf).await?;
 
