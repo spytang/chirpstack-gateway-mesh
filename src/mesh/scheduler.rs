@@ -1,10 +1,9 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
 use log::{debug, info, warn};
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
@@ -82,7 +81,7 @@ static SCHEDULER: Lazy<Scheduler> = Lazy::new(|| Scheduler {
     notify: Notify::new(),
 });
 
-static START: OnceLock<()> = OnceLock::new();
+static START: OnceCell<()> = OnceCell::new();
 
 pub const BEACON_FLOW_ID: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
 
@@ -207,8 +206,8 @@ async fn apply_backoff(toa: &Duration) {
         return;
     }
 
-    let mut rng = rand::thread_rng();
-    let factor = rng.gen_range(1.5..=2.5);
+    let mut rng = rand::rng();
+    let factor = rng.random_range(1.5..=2.5);
     let sleep_time = Duration::from_secs_f64(base * factor);
     debug!(
         "Applying CTP backoff, duration_ms: {}",

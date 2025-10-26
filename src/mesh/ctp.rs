@@ -2,17 +2,17 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use log::{debug, info, trace, warn};
-use once_cell::sync::Lazy;
+use log::{debug, trace, warn};
+use once_cell::sync::{Lazy, OnceCell};
 use tokio::sync::{Mutex, Notify};
 
 use crate::backend;
-use crate::config::{self, Configuration, CtpConfig, DataRate};
+use crate::config::{Configuration, CtpConfig, DataRate};
 use crate::packets::{
     Metric, RouteInfo, RoutingBeaconFlags, RoutingBeaconPayload, RoutingNeighborEntry,
 };
 
-use super::scheduler::{self, TxPlan};
+use super::scheduler::TxPlan;
 
 const MIN_SF: u8 = 7;
 const MAX_SF: u8 = 12;
@@ -303,7 +303,7 @@ static ROUTING_STATE: Lazy<Mutex<RoutingState>> =
     Lazy::new(|| Mutex::new(RoutingState::new([0; 4], false, &Configuration::default())));
 
 static BEACON_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
-static BEACON_LOOP_STARTED: OnceLock<()> = OnceLock::new();
+static BEACON_LOOP_STARTED: OnceCell<()> = OnceCell::new();
 
 pub async fn setup(conf: &Configuration) -> Result<()> {
     let relay_id = backend::get_relay_id().await?;
@@ -322,6 +322,7 @@ pub async fn setup(conf: &Configuration) -> Result<()> {
         tokio::spawn(async {
             cleanup_loop().await;
         });
+        ()
     });
 
     BEACON_NOTIFY.notify_one();
