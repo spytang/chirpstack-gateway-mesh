@@ -19,6 +19,7 @@ const MAX_SF: u8 = 12;
 
 const TOA_TABLE: &[(u8, u16)] = &[(7, 13), (8, 21), (9, 44), (10, 82), (11, 152), (12, 304)];
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct RoutingDecision {
     pub parent: [u8; 4],
@@ -423,11 +424,13 @@ pub async fn notify_inconsistency(child_metric: f32) {
     }
 }
 
+#[allow(dead_code)]
 pub async fn current_path_metric() -> f32 {
     let state = ROUTING_STATE.lock().await;
     state.path_metric
 }
 
+#[allow(dead_code)]
 pub async fn current_route_info() -> RouteInfo {
     let state = ROUTING_STATE.lock().await;
     if let Some(parent) = &state.parent {
