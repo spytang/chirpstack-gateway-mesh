@@ -4,9 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use log::{debug, info, warn};
 use once_cell::sync::{Lazy, OnceCell};
-use rand::Rng;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::sleep;
 
 use crate::packets::MeshPacket;
 use crate::{backend, config, helpers};
@@ -87,9 +85,7 @@ pub const BEACON_FLOW_ID: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
 
 pub fn init() {
     START.get_or_init(|| {
-        tokio::spawn(async {
-            worker_loop().await;
-        });
+        tokio::spawn(worker_loop());
     });
 }
 
@@ -206,12 +202,11 @@ async fn apply_backoff(toa: &Duration) {
         return;
     }
 
-    let mut rng = rand::rng();
-    let factor = rng.random_range(1.5..=2.5);
+    let factor: f64 = rand::random_range(1.5..=2.5);
     let sleep_time = Duration::from_secs_f64(base * factor);
     debug!(
         "Applying CTP backoff, duration_ms: {}",
         sleep_time.as_millis()
     );
-    sleep(sleep_time).await;
+    tokio::time::sleep(sleep_time).await;
 }

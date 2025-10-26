@@ -322,7 +322,6 @@ pub async fn setup(conf: &Configuration) -> Result<()> {
         tokio::spawn(async {
             cleanup_loop().await;
         });
-        ()
     });
 
     BEACON_NOTIFY.notify_one();
@@ -366,9 +365,10 @@ pub async fn record_tx_attempt(parent: [u8; 4], plan: &TxPlan) {
 
 pub async fn record_tx_result(parent: [u8; 4], plan: &TxPlan, success: bool) {
     let mut state = ROUTING_STATE.lock().await;
+    let alpha = state.config.ewma_alpha.clamp(0.01, 1.0);
+    let sample = if success { 1.0 } else { 0.0 };
+
     if let Some(neighbor) = state.neighbors.get_mut(&parent) {
-        let alpha = state.config.ewma_alpha.clamp(0.01, 1.0);
-        let sample = if success { 1.0 } else { 0.0 };
         neighbor.forward_delivery = (1.0 - alpha) * neighbor.forward_delivery + alpha * sample;
         neighbor.forward_delivery = neighbor.forward_delivery.clamp(0.01, 1.0);
         neighbor.sf = plan.data_rate.spreading_factor.clamp(MIN_SF, MAX_SF);
